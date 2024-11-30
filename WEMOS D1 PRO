@@ -1,0 +1,218 @@
+#include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
+
+// Wi-Fi настройки
+const char* ssid = "TP-Link_515A";
+const char* password = "21857638";
+
+// URL для таблиц
+const char* sensorGoogleScriptURL = "https://script.google.com/macros/s/AKfycbz4BRYe3L_Lp4n5MEJ6RGi6cqMai5d26KRVPT9Pgw_dM3heIRa5og1ZW9i-CvMa8O9E/exec";
+const char* buttonGoogleScriptURL = "https://script.google.com/macros/s/AKfycbwoQFseC5w0iiQ-XC6Afaq7DNAAOeLxQbgVdwJ_trLedQVGsK21RNMqTBIGaezW5GDX/exec";
+
+// Настройки для кнопки
+const int buttonPin = D5;  // Кнопка подключена к D5
+const char* buttonColumn = "F"; // Колонка для записи данных кнопки
+
+// Настройки для датчика
+const int sensorPin = D1;       // Датчик подключён к D1
+const int ledRedPin = D2;       // Красный светодиод
+const int ledGreenPin = D3;     // Зелёный светодиод
+const int ledBluePin = D4;      // Синий светодиод
+const char* sensorSheetName = "PS2"; // Лист для записи данных датчика
+
+// Переменные для кнопки
+bool buttonState = HIGH;
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTimeButton = 0;
+const unsigned long debounceDelayButton = 50;
+
+// Переменные для датчика
+bool sensorState = HIGH;
+bool sensorPrevState = HIGH;
+unsigned long lastDebounceTimeSensor = 0;
+const unsigned long debounceDelaySensor = 50;
+unsigned long lastSendTime = 0;
+const unsigned long sendDelay = 3000; 
+unsigned long delayStart = 0;
+bool delayStarted = false;
+
+// Настройка времени
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600 * 3); // Часовой пояс GMT+3 (Мск)
+
+// Функции
+String getMonthYearSheetName();
+int getCurrentDay();
+void sendButtonData();
+void sendSensorData(int sensorValue, int memoryStatus);
+String getWiFiStatus();
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  pinMode(buttonPin, INPUT_PULLUP);  // Кнопка с подтягивающим резистором
+  pinMode(sensorPin, INPUT);         // Датчик как входной
+  pinMode(ledRedPin, OUTPUT);
+  pinMode(ledGreenPin, OUTPUT);
+  pinMode(ledBluePin, OUTPUT);
+
+  digitalWrite(ledRedPin, LOW);
+  digitalWrite(ledGreenPin, LOW);
+  digitalWrite(ledBluePin, LOW);
+
+  // Подключение к Wi-Fi
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(ledRedPin, HIGH);  // Красный светодиод горит при отсутствии Wi-Fi
+  }
+
+  digitalWrite(ledRedPin, LOW);
+  digitalWrite(ledGreenPin, HIGH);  // Зелёный светодиод при подключении к Wi-Fi
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Инициализация NTP
+  timeClient.begin();
+}
+
+void loop() {
+  timeClient.update(); // Обновляем время
+
+  // === ОБРАБОТКА КНОПКИ ===
+  int buttonReading = digitalRead(buttonPin);
+  if (buttonReading != lastButtonState) {
+    lastDebounceTimeButton = millis();
+  }
+
+  if ((millis() - lastDebounceTimeButton > debounceDelayButton) && (buttonReading != buttonState)) {
+    buttonState = buttonReading;
+
+    if (buttonState == LOW) {  // Если кнопка нажата
+      Serial.println("Button pressed!");
+      sendButtonData();
+    }
+  }
+  lastButtonState = buttonReading;
+
+  // === ОБРАБОТКА ДАТЧИКА ===
+  int sensorReading = digitalRead(sensorPin);
+  if (sensorReading != sensorPrevState) {
+    lastDebounceTimeSensor = millis();
+    sensorPrevState = sensorReading;
+  }
+
+  if ((millis() - lastDebounceTimeSensor > debounceDelaySensor) && (sensorReading != sensorState)) {
+    sensorState = sensorReading;
+
+    if (sensorState == LOW && (millis() - lastSendTime > sendDelay)) {
+      Serial.println("Sensor triggered");
+      delayStart = millis();
+      delayStarted = true;
+      lastSendTime = millis();
+
+      // Мигнуть светодиодами
+      digitalWrite(ledGreenPin, LOW);
+      digitalWrite(ledBluePin, HIGH);
+      delay(100);
+      digitalWrite(ledBluePin, LOW);
+      digitalWrite(ledGreenPin, HIGH);
+    }
+  }
+
+  // Отправка данных с датчика
+  if (delayStarted && (millis() - delayStart >= 1000)) {
+    sendSensorData(1, 0);  // Отправка данных
+    delayStarted = false;
+  }
+}
+
+// === ФУНКЦИИ КНОПКИ ===
+void sendButtonData() {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+  HTTPClient http;
+
+  String sheetName = getMonthYearSheetName();
+  int currentDay = getCurrentDay();
+  int row = currentDay + 1;
+
+  String url = String(buttonGoogleScriptURL) + "?column=" + buttonColumn + "&row=" + row + "&sheet=" + sheetName;
+  Serial.print("Requesting URL: ");
+  Serial.println(url);
+
+  http.begin(*client, url);
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    Serial.printf("HTTP Code: %d\n", httpCode);
+  } else {
+    Serial.printf("Error on HTTP request: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+}
+
+// === ФУНКЦИИ ДАТЧИКА ===
+void sendSensorData(int sensorValue, int memoryStatus) {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+  HTTPClient http;
+
+  String wifiStatus = getWiFiStatus();
+
+  String url = String(sensorGoogleScriptURL) + "?button=" + String(sensorValue) + "&memory=" + String(memoryStatus) +
+               "&wifiStatus=" + wifiStatus + "&sheet=" + sensorSheetName;
+  Serial.print("Requesting URL: ");
+  Serial.println(url);
+
+  http.begin(*client, url);
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    Serial.printf("HTTP Code: %d\n", httpCode);
+  } else {
+    Serial.printf("Error on HTTP request: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+}
+
+// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+String getMonthYearSheetName() {
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm* timeInfo = localtime(&rawTime);
+  int currentMonth = timeInfo->tm_mon + 1;
+  int currentYear = timeInfo->tm_year + 1900;
+  return String(currentMonth) + "." + String(currentYear % 100);
+}
+
+int getCurrentDay() {
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm* timeInfo = localtime(&rawTime);
+  return timeInfo->tm_mday;
+}
+
+String getWiFiStatus() {
+  int rssi = WiFi.RSSI();
+  if (WiFi.status() != WL_CONNECTED) {
+    return "6";
+  } else if (rssi >= -50) {
+    return "1";
+  } else if (rssi >= -60) {
+    return "2";
+  } else if (rssi >= -70) {
+    return "3";
+  } else if (rssi >= -80) {
+    return "4";
+  } else {
+    return "5";
+  }
+}
